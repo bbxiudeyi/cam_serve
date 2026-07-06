@@ -2,6 +2,27 @@
 
 Rust + axum + nokhwa，把 USB 摄像头的实时画面推到浏览器。
 
+## 快速开始
+
+> 首次运行需要先编译一次后端:`cargo build --release`(产物在 `target\release\cam-stream.exe`)。
+> 之后双击 bat 即可,无需再编译。
+
+```
+# 1. 插上 USB 摄像头
+# 2. 启动
+run-cam.bat
+
+# 3. 浏览器打开
+serve.bat
+```
+
+两个 bat 双击运行,会各自打开一个命令行窗口:
+
+- `run-cam.bat` —— 启动视频流后端(`cam-stream.exe`,监听 `0.0.0.0:3000`)
+- `serve.bat` —— 启动网页托管(`serve.py`,监听 `0.0.0.0:8000`,自动打开浏览器到 `http://localhost:8000/demo.html`)
+
+关掉对应窗口即停止服务。先开哪个都行,网页会自动等后端上线。
+
 ## 架构
 
 本项目由**两个独立进程**组成,各自职责清晰:
@@ -55,20 +76,6 @@ python serve.py
 ```
 
 Windows 下也可以直接双击 `run-cam.bat`(`cargo build --release` 后启动 `target\release\cam-stream.exe`)和 `serve.bat`。
-
-### 方式二:运行已编译产物
-
-```bash
-# 1. 先编译出 release exe(只需做一次,改了源码再重新编译)
-cargo build --release
-#    产物在 target/release/cam-stream.exe
-
-# 2. 双击 run-cam.bat 启动后端
-# 3. 双击 serve.bat 启动网页托管
-# 4. 浏览器访问 http://localhost:8000/demo.html
-```
-
-> `run-cam.bat` 会切到项目根目录运行 exe(因为 exe 用相对路径定位 `logs/`)。
 
 ### 页面操作
 
