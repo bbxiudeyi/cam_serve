@@ -6,13 +6,18 @@
 //! 浏览器访问 http://localhost:3000 即可看到实时画面。
 //!
 //! 端点：
-//!   GET  /              HTML 页面
-//!   GET  /stream        MJPEG multipart 流（<img src="/stream"> 直接显示）
 //!   GET  /ws            WebSocket 传输 JPEG 帧（前端可用 <canvas> 渲染 + 显示 FPS）
 //!   GET  /api/cameras   列出所有可用摄像头
 //!   GET  /api/health    健康检查
 
+// release 构建在 Windows 上用 GUI 子系统,双击 exe 不弹黑窗。
+// debug 构建保留控制台,方便看 eprintln! / 日志输出。
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 mod camera;
+mod log_viewer;
+mod settings_app;
+mod tray;
 
 use anyhow::Result;
 use axum::{
@@ -24,6 +29,7 @@ use axum::{
     routing::get,
     Router,
 };
+use eframe::egui;
 use camera::JpegFrame;
 use std::{
     sync::atomic::{AtomicI64, AtomicU8},
@@ -36,52 +42,130 @@ use tracing_subscriber::{prelude::*, EnvFilter};
 
 const CHANNEL_CAPACITY: usize = 8; // 最多缓存 8 帧，避免慢客户端拖累采集线程
 
-/// 全局应用状态
+/// 摄像头相关、需要跨「后台 axum 线程」和「主线程 GUI」共享的控制状态。
+///
+/// 这是两个世界的桥梁:GUI(设置窗口)读写它来枚举/选择摄像头,
+/// 后台 camera_manager_loop 读它决定用哪个设备、收切换命令。
+///
+/// - `cameras`:设备列表,设置窗口打开时刷新。RwLock 因为读多写少。
+/// - `current_index`:当前选中的摄像头 index。AtomicU32 因为只读写一个 u32。
+/// - `switch_tx`:切换命令通道。设置窗口 send,管理循环 recv_timeout。
+#[derive(Clone)]
+pub(crate) struct SharedControl {
+    pub cameras: Arc<parking_lot::RwLock<Vec<camera::CameraInfo>>>,
+    pub current_index: Arc<std::sync::atomic::AtomicU32>,
+    pub switch_tx: std::sync::mpsc::Sender<u32>,
+}
+
+/// 全局应用状态(axum router 用)
 #[derive(Clone)]
 struct AppState {
     /// 帧广播通道
     tx: broadcast::Sender<JpegFrame>,
-    /// 摄像头可用信息
-    cameras: Arc<Vec<camera::CameraInfo>>,
+    /// 摄像头共享控制(含设备列表、当前 index、切换通道)
+    control: SharedControl,
     /// 摄像头连接状态(0=Disconnected, 1=Connecting, 2=Streaming)
     camera_status: Arc<AtomicU8>,
 }
 
 /// 返回 exe 所在目录。取不到(如非 Windows)则回退到当前工作目录。
 /// 用来定位 logs/ 目录,保证无论从哪里双击 exe,日志都落在 exe 旁边。
-fn exe_dir() -> std::path::PathBuf {
+pub(crate) fn exe_dir() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
-#[tokio::main]
-async fn main() {
-    // 把实际工作放到 run(),main 负责捕获错误后"暂停等按键",
-    // 这样双击 exe 启动时窗口不会秒退,用户能看清错误信息。
-    if let Err(e) = run().await {
-        eprintln!();
-        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        eprintln!("❌ 程序出错退出:");
-        eprintln!("{e:#}");
-        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        eprintln!("💡 常见原因:");
-        eprintln!("   • 没有可用摄像头(检查 USB 连接 / 设备管理器)");
-        eprintln!("   • 摄像头被其他程序占用(浏览器、Zoom、会议软件)");
-        eprintln!("   • Windows 隐私设置禁用了摄像头访问");
-        eprintln!("   • 换设备号试试:设置环境变量 CAM_INDEX=1");
-        eprintln!();
-        eprintln!("详细日志见 exe 同级 logs/ 目录下的日志文件。");
-        eprintln!();
-        eprintln!("按 Enter 键关闭窗口…");
-        let mut buf = String::new();
-        let _ = std::io::stdin().read_line(&mut buf);
-        std::process::exit(1);
-    }
+fn main() -> eframe::Result<()> {
+    // 架构:主线程跑 GUI 事件循环(eframe + tray-icon);axum + 摄像头放到后台线程的
+    // tokio runtime 里。两个世界通过 SharedControl(通道 + 原子)通信。
+
+    // ---------- 创建共享控制状态(在 main 里,两个世界都能 clone) ----------
+    let initial_index: u32 = std::env::var("CAM_INDEX")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let (switch_tx, switch_rx) = std::sync::mpsc::channel::<u32>();
+    let control = SharedControl {
+        cameras: Arc::new(parking_lot::RwLock::new(Vec::new())),
+        current_index: Arc::new(std::sync::atomic::AtomicU32::new(initial_index)),
+        switch_tx,
+    };
+
+    // ---------- 后台线程:tokio runtime + axum + 摄像头采集 ----------
+    // 后端错误通过 backend_error 传回主线程,在设置窗口里显示。
+    let backend_error: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    let backend = std::thread::Builder::new()
+        .name("cam-backend".into())
+        .spawn({
+            let control = control.clone();
+            let err_slot = backend_error.clone();
+            move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let msg = format!("创建 tokio runtime 失败: {e}");
+                        *err_slot.lock().unwrap() = Some(msg.clone());
+                        tracing::error!("{msg}");
+                        return;
+                    }
+                };
+                if let Err(e) = runtime.block_on(run(control, switch_rx)) {
+                    // 后端致命错误(端口被占用、摄像头初始化异常等)。
+                    // 落盘日志 + 传回主线程显示。
+                    let msg = format!("{e:#}");
+                    tracing::error!("后端退出: {msg}");
+                    *err_slot.lock().unwrap() = Some(msg);
+                }
+            }
+        })
+        .expect("无法创建后端线程");
+
+    // ---------- 主线程:eframe 事件循环 ----------
+    // 窗口配置:主窗口默认隐藏(无头运行,交互走托盘),设置时变可见。
+    // - with_visible(false):启动时不显示
+    // - with_inner_size:设置 UI 的尺寸(显示时用)
+    // - with_resizable(false):设置窗口固定大小
+    // 任务栏:默认隐藏时不占位;egui 在 with_visible 时会处理任务栏显示
+    let viewport = egui::ViewportBuilder::default()
+        .with_visible(false)
+        .with_inner_size([420.0, 280.0])
+        .with_resizable(false)
+        .with_title("cam-stream 设置");
+
+    let native_options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "cam-stream",
+        native_options,
+        Box::new(move |_cc| {
+            // 托盘必须在创建 eframe app 的同一线程(事件循环线程)里 build,
+            // 否则 Windows 上收不到托盘消息。
+            let tray = tray::build();
+            Ok(Box::new(settings_app::CamApp::new(
+                tray,
+                control.clone(),
+                backend_error.clone(),
+            )))
+        }),
+    )?;
+
+    // eframe 退出后(用户点了托盘「退出」),后端线程可能还在跑 axum。
+    // 直接 exit 最干净 —— 后台的 axum::serve 会被强制中断,但日志已落盘。
+    drop(backend); // detach
+    std::process::exit(0);
 }
 
-async fn run() -> Result<()> {
+async fn run(control: SharedControl, switch_rx: std::sync::mpsc::Receiver<u32>) -> Result<()> {
     // ---------- 日志 ----------
     // 输出到两处:① 控制台(双击 exe 时实时滚动);② 文件(按天滚动,exe 同级 logs/)。
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -105,10 +189,8 @@ async fn run() -> Result<()> {
         .init();
 
     // ---------- 启动参数 ----------
-    let camera_index: u32 = std::env::var("CAM_INDEX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    // camera_index 不在这里读了:改由 camera_manager_loop 每轮循环从 control.current_index
+    // 读最新值(支持运行时热切换)。初始值在 main 里从 CAM_INDEX 读。
     let width: u32 = std::env::var("CAM_WIDTH")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -125,10 +207,14 @@ async fn run() -> Result<()> {
         .unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
     // ---------- 摄像头 ----------
-    let cameras = Arc::new(camera::list_cameras());
-    tracing::info!("检测到 {} 个摄像头设备:", cameras.len());
-    for c in cameras.iter() {
-        tracing::info!("  [{}] {} - {}", c.index, c.name, c.description);
+    // 设备列表存进共享 control(cameras 字段),供设置窗口和 /api/cameras 刷新/读取。
+    {
+        let cams = camera::list_cameras();
+        tracing::info!("检测到 {} 个摄像头设备:", cams.len());
+        for c in cams.iter() {
+            tracing::info!("  [{}] {} - {}", c.index, c.name, c.description);
+        }
+        *control.cameras.write() = cams;
     }
 
     // broadcast channel 先于摄像头创建:即使没有订阅者,send 也只是无操作,
@@ -141,16 +227,18 @@ async fn run() -> Result<()> {
 
     // 启动后台任务:持续重试连接摄像头,连上后监控掉线,掉线自动重连。
     // 用 spawn_blocking 因为 spawn_capture 内部是阻塞调用(nokhwa CallbackCamera)。
+    // switch_rx 由 main 创建并通过 run 参数传入;control.switch_tx 供设置窗口发命令。
     tokio::task::spawn_blocking({
         let camera_status = camera_status.clone();
         let last_frame_time = last_frame_time.clone();
         let tx = tx.clone();
-        move || camera_manager_loop(camera_index, width, height, fps, tx, camera_status, last_frame_time)
+        let control = control.clone();
+        move || camera_manager_loop(control, switch_rx, width, height, fps, tx, camera_status, last_frame_time)
     });
 
     let state = AppState {
         tx,
-        cameras: cameras.clone(),
+        control,
         camera_status,
     };
 
@@ -179,8 +267,12 @@ async fn run() -> Result<()> {
 
 /// 摄像头后台管理循环:重试连接 → 采集 → 掉线检测 → 重连。
 /// 在 spawn_blocking 线程里跑,内部用 std::thread::sleep(不能用 tokio 的 sleep)。
+///
+/// 热切换:`switch_rx` 收到新 index 时,立即 break 当前设备去重连新设备。
+/// 「停旧开新」靠 break → info drop(释放设备)→ 外层 loop 重新 spawn_capture 天然完成。
 fn camera_manager_loop(
-    camera_index: u32,
+    control: SharedControl,
+    switch_rx: std::sync::mpsc::Receiver<u32>,
     width: u32,
     height: u32,
     fps: u32,
@@ -198,6 +290,11 @@ fn camera_manager_loop(
     let mut last_enum = None::<std::time::Instant>;
 
     loop {
+        // 每轮循环读最新 index(用户可能从设置窗口切换了设备)
+        let camera_index = control
+            .current_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+
         // 标记为"连接中"
         camera_status.store(
             camera::CameraStatus::Connecting as u8,
@@ -214,18 +311,34 @@ fn camera_manager_loop(
                 );
                 tracing::info!("摄像头已连接,实际分辨率 {}x{},开始推流", info.width, info.height);
 
-                // 监控掉线:每秒检查 last_frame_time,超过 STALL_TIMEOUT 没有新帧就重连。
-                // 不调用 camera.is_streaming()——nokhwa 0.10 有已知锁问题(issue #111)。
-                // info 在循环末尾 drop,触发停止采集。
-                while let Some(since_last) = millis_since(&last_frame_time) {
-                    if Duration::from_millis(since_last as u64) > STALL_TIMEOUT {
-                        tracing::warn!("摄像头已 {} 秒无新帧,判定掉线,准备重连", STALL_TIMEOUT.as_secs());
-                        break;
+                // 监控掉线 + 切换命令:用 recv_timeout(1s) 代替 sleep(1s)。
+                //   - 超时(Err Timeout) = 正常轮询,继续检查 last_frame_time
+                //   - Ok(new_idx) = 用户要切换设备,break 去重连新设备
+                // info 在 break 后 block 结束时 drop,触发停止采集(释放设备句柄)。
+                loop {
+                    // 先检查掉线
+                    if let Some(since_last) = millis_since(&last_frame_time) {
+                        if Duration::from_millis(since_last as u64) > STALL_TIMEOUT {
+                            tracing::warn!("摄像头已 {} 秒无新帧,判定掉线,准备重连", STALL_TIMEOUT.as_secs());
+                            break;
+                        }
                     }
-                    std::thread::sleep(Duration::from_secs(1));
+                    // 用 recv_timeout 代替 sleep,顺便监听切换命令
+                    match switch_rx.recv_timeout(Duration::from_secs(1)) {
+                        Ok(new_idx) => {
+                            tracing::info!("收到切换命令 → index={},切换摄像头", new_idx);
+                            // current_index 已由设置窗口更新,这里只需 break 重连
+                            break;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            // switch_tx 被 drop(程序退出中),直接退出循环
+                            tracing::info!("切换通道已关闭,退出摄像头管理循环");
+                            return;
+                        }
+                    }
                 }
-                // 这里 info 被 drop,CallbackCamera 停止采集。
-                // 掉线重连前也重新枚举一次(节流),方便排查是 USB 掉线还是被占用。
+                // info 在这里 drop,CallbackCamera 停止采集。
                 maybe_reenumerate(&mut last_enum, REENUM_INTERVAL);
             }
             Err(e) => {
@@ -234,10 +347,16 @@ fn camera_manager_loop(
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 tracing::warn!("连接摄像头失败: {e:#},{} 秒后重试", RECONNECT_INTERVAL.as_secs());
-                // 打开失败很可能是被占用或设备已拔出。失败时重新枚举摄像头,
-                // 用户能从日志看出摄像头还在不在系统里。节流避免每 3 秒刷屏。
                 maybe_reenumerate(&mut last_enum, REENUM_INTERVAL);
-                std::thread::sleep(RECONNECT_INTERVAL);
+                // 失败重试也用 recv_timeout,这样切换命令能在等待期间及时响应
+                match switch_rx.recv_timeout(RECONNECT_INTERVAL) {
+                    Ok(new_idx) => {
+                        tracing::info!("(等待重试期间)收到切换命令 → index={}", new_idx);
+                        // 直接进入下一轮循环,用新 index 重连
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
             }
         }
     }
@@ -289,7 +408,9 @@ async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn list_cameras_handler(State(state): State<AppState>) -> impl IntoResponse {
-    axum::Json(state.cameras.as_ref().clone())
+    // 读共享的设备列表(设置窗口可能已经刷新过它)
+    let cams = state.control.cameras.read().clone();
+    axum::Json(cams)
 }
 
 /// WebSocket 流：每条 binary message 是一帧 JPEG，前端用 canvas 渲染

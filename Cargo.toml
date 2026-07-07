@@ -29,6 +29,11 @@ tracing-appender = "0.2"
 # 异步通道 / 共享状态
 parking_lot = "0.12"
 
+# GUI / 系统托盘(Windows 桌面交互)
+eframe = "0.31"
+tray-icon = "0.24"
+muda = "0.19"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

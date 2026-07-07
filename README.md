@@ -16,12 +16,24 @@ run-cam.bat
 serve.bat
 ```
 
-两个 bat 双击运行,会各自打开一个命令行窗口:
+两个 bat 双击运行:
 
-- `run-cam.bat` —— 启动视频流后端(`cam-stream.exe`,监听 `0.0.0.0:3000`)
+- `run-cam.bat` —— 启动视频流后端(`cam-stream.exe`,监听 `0.0.0.0:3000`)。**release 构建不弹黑窗**,只在系统托盘(右下角)显示一个摄像头图标。
 - `serve.bat` —— 启动网页托管(`serve.py`,监听 `0.0.0.0:8000`,自动打开浏览器到 `http://localhost:8000/demo.html`)
 
-关掉对应窗口即停止服务。先开哪个都行,网页会自动等后端上线。
+### 系统托盘交互
+
+`cam-stream.exe`(release 构建)启动后,在 Windows 任务栏右下角显示摄像头图标。**右键**该图标弹出菜单:
+
+| 菜单项 | 作用 |
+|--------|------|
+| **查看实时日志** | 打开一个 Windows Terminal / PowerShell 窗口,实时滚动显示 `logs/` 下的最新日志(`Get-Content -Wait`,等价 `tail -f`) |
+| **设置...** | 弹出设备选择窗口,列出当前可用的摄像头,选中后点「应用并切换」即可**运行时切换摄像头,无需重启** |
+| **退出** | 结束整个程序(关闭 HTTP 服务、释放摄像头、移除托盘图标) |
+
+> debug 构建(`cargo run`)保留控制台窗口显示日志,便于调试;release 构建完全无窗口,只有托盘。
+
+关掉 serve.bat 窗口 = 停止网页托管(后端仍在跑)。退出后端请用托盘 → 退出。
 
 ## 架构
 
@@ -54,8 +66,10 @@ serve.bat
 - 🔌 **WebSocket 模式**:浏览器实时接收 JPEG 帧 + 渲染
 - 📡 **多客户端**:`tokio::broadcast` 通道,多个浏览器同时观看不互相拖累
 - 🔁 **双向自动重连**:后端检测摄像头掉线会重连;前端检测后端离线也会重连
+- 🖥️ **系统托盘**:release 构建无窗口运行,托盘右键菜单提供「查看日志 / 设置 / 退出」
+- 🎛️ **摄像头热切换**:托盘「设置」窗口选设备,无需重启即可切换
 - ⚙️ **环境变量配置**:分辨率、帧率、设备 index、监听地址都能改
-- 📝 **双路日志**:控制台实时滚动 + exe 同级 `logs/` 目录按天滚动
+- 📝 **双路日志**:控制台实时滚动(debug)+ exe 同级 `logs/` 目录按天滚动(所有构建)
 
 ## 使用说明
 
@@ -141,15 +155,19 @@ cam_serve/
 ├── Cargo.toml            Rust 依赖与 release profile
 ├── Cargo.lock            依赖锁(已纳入版本库,保证构建一致)
 ├── src/
-│   ├── main.rs           axum 路由、WebSocket handler、摄像头管理循环、日志初始化
-│   └── camera.rs         nokhwa 摄像头封装:CallbackCamera 抓帧 → RGB → JPEG
+│   ├── main.rs           入口:主线程 eframe 事件循环 + 后台线程 tokio runtime;
+│   │                     axum 路由、WebSocket handler、摄像头管理循环(支持热切换)、日志
+│   ├── camera.rs         nokhwa 摄像头封装:CallbackCamera 抓帧 → RGB → JPEG
+│   ├── tray.rs           tray-icon 系统托盘 + 右键菜单(查看日志/设置/退出)
+│   ├── settings_app.rs   egui 设置窗口:设备选择 + 热切换,拦截窗口关闭
+│   └── log_viewer.rs     「查看实时日志」:启动 wt.exe/powershell tail 日志文件
 ├── static/
 │   └── demo.html         前端页面(WebSocket 客户端 + Canvas 渲染)
 ├── serve.py              Python 静态托管 demo.html + 后端健康轮询
 ├── run-cam.bat           双击启动 cam-stream.exe(后端)
 ├── serve.bat             双击启动 serve.py(网页托管)
 ├── handle_tool/          Sysinternals Handle.exe(调试摄像头被占用时查句柄,带 EULA)
-└── logs/                 运行时生成,按天滚动(cam-stream.logYYYYMMDD)
+└── logs/                 运行时生成,按天滚动(cam-stream.log.YYYY-MM-DD)
 ```
 
 ### 技术栈 & 关键设计
@@ -159,8 +177,15 @@ cam_serve/
 - **image 0.25** — `decode_image::<RgbFormat>()` 把 MJPG/NV12 等转成 RGB,再用 `JpegEncoder` 编码成 JPEG(quality=80)
 - **tokio::broadcast** — 多客户端扇出。容量 8 帧,慢客户端会被 `Lagged` 跳过而非阻塞采集线程
 - **tracing + tracing-appender** — 双路日志:stderr 实时滚动 + 文件按天滚动,落在 exe 同级 `logs/`
+- **eframe 0.31 + egui** — GUI 框架,主线程跑事件循环,承载托盘和设置窗口
+- **tray-icon 0.24 + muda 0.19** — 系统托盘 + 右键菜单(与 eframe 共享 winit 事件循环)
+- **`#![cfg_attr(windows_subsystem = "windows")]`** — release 构建切 GUI 子系统,双击 exe 不弹黑窗
+
+**双线程架构**:主线程跑 eframe 事件循环(托盘 + 设置窗口),后台线程跑 tokio runtime(axum + 摄像头)。两个世界通过 `SharedControl`(`Arc<RwLock<Vec<CameraInfo>>>` + `Arc<AtomicU32>` + `mpsc::Sender`)通信。
 
 **摄像头管理循环**(`camera_manager_loop`):连接 → 推流 → 监控掉线(5 秒无新帧判掉线)→ 重连(3 秒间隔)→ 重新枚举设备(15 秒节流,避免刷屏)。整个循环在 `spawn_blocking` 线程里跑,不能用 `tokio::sleep`。
+
+**摄像头热切换**:设置窗口选设备 → `current_index.store(new)` + `switch_tx.send(new)`。管理循环用 `switch_rx.recv_timeout(1s)` 代替 `sleep(1s)`,收到命令立即 break → drop 旧 `CaptureInfo`(释放设备)→ 外层 loop 用新 index 重连。「停旧开新」靠作用域天然完成,无需手动管理。
 
 ### 构建与运行
 
@@ -215,3 +240,5 @@ cargo build      # 拉取并编译新依赖,自动更新 Cargo.lock
 - **nokhwa 0.10** —— 跨平台摄像头捕获(Windows 上用 Media Foundation)
 - **image 0.25** —— RGB → JPEG 编码
 - **tokio::broadcast** —— 多客户端扇出
+- **eframe 0.31 + egui** —— GUI(设置窗口)
+- **tray-icon 0.24 + muda** —— 系统托盘 + 右键菜单
