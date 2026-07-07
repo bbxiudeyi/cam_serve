@@ -10,10 +10,16 @@ axum = { version = "0.8", features = ["multipart", "ws"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 
-# 摄像头捕获：Windows 用 Media Foundation（系统自带），不需要装额外运行时
-nokhwa = { version = "0.10", default-features = false, features = ["input-msmf", "output-threaded"] }
+# 摄像头捕获：直接用 Windows Media Foundation 原生 API
+# （支持采集卡 + 摄像头；nokhwa 对采集卡格式协商有 bug）
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Variant",
+] }
 
-# 图像处理（nokhwa 输出 RGB 字节，需要编码成 JPEG 推给浏览器）
+# 图像处理（RGB -> JPEG 编码）
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 bytes = "1"
 

@@ -1,28 +1,35 @@
-//! 摄像头捕获模块
+//! 摄像头捕获模块（Windows Media Foundation 原生实现）
 //!
-//! 用 nokhwa 的 `CallbackCamera`（内部用专属线程抓帧，回调发送给我们），
-//! 每帧编码成 JPEG 字节后通过 broadcast 通道推给所有 HTTP 客户端。
-
-use anyhow::Result;
-use nokhwa::{
-    pixel_format::RgbFormat,
-    query,
-    threaded::CallbackCamera,
-    utils::{ApiBackend, CameraIndex, RequestedFormat, RequestedFormatType},
-};
-use std::sync::atomic::AtomicI64;
+//! 直接用 Media Foundation 的 IMFSourceReader 读帧，绕开 nokhwa
+//! 对采集卡格式协商的 bug。优先选择 MJPG（直接透传给浏览器，零编码成本），
+//! 其次 RGB32（转成 JPEG）。对外接口与原 nokhwa 版本一致。
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 use tokio::sync::broadcast;
+use windows::core::PCWSTR;
+use windows::Win32::Media::MediaFoundation::{
+    IMFActivate, IMFAttributes, IMFMediaSource, IMFSample, IMFSourceReader,
+    MFCreateAttributes, MFCreateSourceReaderFromMediaSource, MFEnumDeviceSources, MFStartup,
+    MF_MT_FRAME_SIZE, MF_MT_SUBTYPE, MF_VERSION, MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+    MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MFVideoFormat_MJPG, MFVideoFormat_RGB32,
+};
+use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 
-/// 一帧 JPEG 图像（已编码好的字节流，可直接发给浏览器）
+/// COM 接口的 Send wrapper。Media Foundation 在 MTA（多线程单元）下接口是
+/// 线程安全的，这里 unsafe impl Send 允许把接口 move 到采集线程。
+struct SendCom<T>(T);
+unsafe impl<T> Send for SendCom<T> {}
+
 #[derive(Clone)]
 pub struct JpegFrame {
-    pub bytes: bytes::Bytes,
+    pub bytes: Bytes,
     pub seq: u64,
 }
 
-/// 摄像头连接状态(供 AppState 共享,暴露给 /api/health)
-/// 用 AtomicU8 存储,值对应下面的枚举判别数。
 #[derive(Clone, Copy, Debug)]
 pub enum CameraStatus {
     Disconnected = 0,
@@ -31,7 +38,6 @@ pub enum CameraStatus {
 }
 
 impl CameraStatus {
-    /// 从 AtomicU8 读出的值还原成枚举
     pub fn from_u8(v: u8) -> Self {
         match v {
             1 => CameraStatus::Connecting,
@@ -48,153 +54,327 @@ impl CameraStatus {
     }
 }
 
-/// 实际分辨率（摄像头最终应用的格式）
 pub struct CaptureInfo {
     pub width: u32,
     pub height: u32,
-    /// 持有它，drop 时自动停止采集
-    _camera: CallbackCamera,
+    stop: Arc<AtomicBool>,
 }
 
-/// 启动摄像头采集。返回 `CaptureInfo`，需要一直持有它，
-/// 一旦 drop 摄像头采集循环就会停止。
-///
-/// `last_frame_time`:共享的"最后一帧时间戳"(Unix 毫秒)。callback 每成功
-/// 编码一帧就更新它,供外部的掉线监控线程检查"距上一帧多久了"。
-pub fn spawn_capture(
-    camera_index: u32,
+impl Drop for CaptureInfo {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+struct ChosenFormat {
     width: u32,
     height: u32,
-    fps: u32,
+    is_mjpg: bool,
+}
+
+/// 枚举视频输入设备，返回 IMFActivate 数组 + 数量。
+/// 调用方负责 CoTaskMemFree 顶层数组指针。
+unsafe fn enum_devices() -> Result<(Vec<IMFActivate>, u32)> {
+    let mut attrs: Option<IMFAttributes> = None;
+    MFCreateAttributes(&mut attrs, 1)?;
+    let attrs = attrs.ok_or_else(|| anyhow!("MFCreateAttributes 返回空"))?;
+    attrs.SetGUID(
+        &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+        &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    )?;
+
+    let mut raw_ptr: *mut Option<IMFActivate> = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    MFEnumDeviceSources(&attrs, &mut raw_ptr, &mut count)?;
+
+    // raw_ptr 指向 count 个 Option<IMFActivate>。把它们克隆出来，
+    // 然后释放顶层数组（IMFActivate 自身的引用计数由 clone 维持）。
+    let slice = std::slice::from_raw_parts(raw_ptr, count as usize);
+    let out: Vec<IMFActivate> = slice
+        .iter()
+        .filter_map(|x| x.clone())
+        .collect();
+    CoTaskMemFree(Some(raw_ptr as *const _));
+    Ok((out, count))
+}
+
+pub fn spawn_capture(
+    camera_index: u32,
+    req_width: u32,
+    req_height: u32,
+    req_fps: u32,
     tx: broadcast::Sender<JpegFrame>,
     last_frame_time: Arc<AtomicI64>,
 ) -> Result<CaptureInfo> {
-    // 请求格式:用 None,让 nokhwa/MediaFoundation 自己挑摄像头支持的格式(MJPG/NV12 都行)。
-    //
-    // 为什么不能用 Closest(RAWRGB):C270 等大多数 USB 摄像头在 640x480 等分辨率下
-    // 只输出 MJPG/NV12,根本不给 RAWRGB。nokhwa 的 Closest 只在同格式内找最接近分辨率,
-    // 不会跨格式(不会 MJPG→RGB),所以会报 "Failed to fulfill requested format"。
-    //
-    // None 的语义(见 nokhwa_core fulfill()):遍历摄像头支持的所有格式,挑第一个我们
-    // 解码器(RgbFormat)能处理的。抓到 MJPG/NV12 后,回调里 decode_image::<RgbFormat>()
-    // 会自动转成 RGB,再编码成 JPEG 推给浏览器。width/height/fps 参数这里不再参与选格式,
-    // 但保留在 CaptureInfo 里供日志参考。
-    //
-    // 注:如果以后想精确控制分辨率,可以用 HighestResolution(Resolution::new(width,height))
-    // 它不限定像素格式,只按分辨率筛选。
-    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::None);
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        MFStartup(MF_VERSION, 0).ok().ok_or_else(|| anyhow!("MFStartup 失败"))?;
 
-    // 共享计数器（callback 在 nokhwa 内部线程里跑，需要 Arc<AtomicU64>）
-    let seq_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-    let callback = {
-        let seq_counter = seq_counter.clone();
-        let tx = tx.clone();
-        let last_frame_time = last_frame_time.clone();
-        move |buffer: nokhwa::Buffer| {
-            let seq = seq_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            match buffer.decode_image::<RgbFormat>() {
-                Ok(img) => {
-                    // 用解码后图像自带的尺寸，而非请求分辨率：摄像头实际生效的
-                    // 分辨率可能与请求值不同（nokhwa 会选最接近的支持值），用错
-                    // 会导致 RGB buffer 长度对不上，编码失败或画面错位。
-                    let (w, h) = img.dimensions();
-                    let rgb = img.into_raw();
-                    match encode_rgb_to_jpeg(&rgb, w, h, 80) {
-                        Ok(jpeg) => {
-                            // 记录这一帧的时间戳(自 epoch 的毫秒),供掉线检测用
-                            let now = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0);
-                            last_frame_time.store(now, std::sync::atomic::Ordering::Relaxed);
-                            let _ = tx.send(JpegFrame {
-                                bytes: bytes::Bytes::from(jpeg),
-                                seq,
-                            });
-                        }
-                        Err(e) => tracing::warn!("JPEG 编码失败: {e}"),
-                    }
-                }
-                Err(e) => tracing::warn!("帧解码失败: {e}"),
-            }
+        let (activates, count) = enum_devices()?;
+        if count == 0 {
+            return Err(anyhow!("系统未检测到任何视频输入设备"));
         }
-    };
-
-    // 用 Debug 格式 {:#?} 保留 nokhwa 的完整错误链。原来 .with_context() 只盖了一层
-    // "无法打开摄像头",真实原因(Media Foundation 协商失败、格式不支持等)被吞掉了。
-    let mut camera = match CallbackCamera::new(
-        CameraIndex::Index(camera_index),
-        requested,
-        callback,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            // e 是 nokhwa::NokhwaError,打印它的 Debug 能看到内部细节
-            return Err(anyhow::anyhow!(
-                "CallbackCamera::new 失败(index={}): {e:#?}",
-                camera_index
+        if camera_index >= count {
+            return Err(anyhow!(
+                "设备 index={} 不存在（共 {} 个设备）",
+                camera_index,
+                count
             ));
         }
-    };
+        let activate = &activates[camera_index as usize];
 
-    let actual_format = match camera.camera_format() {
-        Ok(f) => f,
-        Err(e) => {
-            return Err(anyhow::anyhow!("读取摄像头格式失败: {e:#?}"));
-        }
-    };
-    let actual_w = actual_format.width();
-    let actual_h = actual_format.height();
+        let source: IMFMediaSource = activate
+            .ActivateObject::<IMFMediaSource>()
+            .map_err(|e| anyhow!("ActivateObject 失败(index={}): {e}", camera_index))?;
+        let reader: IMFSourceReader =
+            MFCreateSourceReaderFromMediaSource(&source, None)
+                .map_err(|e| anyhow!("MFCreateSourceReaderFromMediaSource 失败: {e}"))?;
 
-    tracing::info!(
-        "摄像头已打开: index={} 实际 {}x{} @{}fps 格式={:?}(请求 {}x{}@{}fps,格式由摄像头自选)",
-        camera_index,
-        actual_w,
-        actual_h,
-        actual_format.frame_rate(),
-        actual_format.format(),
-        width,
-        height,
-        fps
-    );
+        reader
+            .SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, true)
+            .ok();
 
-    // 启动采集流
-    if let Err(e) = camera.open_stream() {
-        return Err(anyhow::anyhow!("启动摄像头采集流失败: {e:#?}"));
+        let chosen = choose_native_format(&reader, req_width, req_height)?;
+        let cap_width = chosen.width;
+        let cap_height = chosen.height;
+        tracing::info!(
+            "摄像头已打开: index={} 实际 {}x{} 格式={}{}(请求 {}x{}@{}fps)",
+            camera_index,
+            cap_width,
+            cap_height,
+            if chosen.is_mjpg { "MJPG" } else { "RGB32" },
+            if chosen.is_mjpg { "(JPEG 透传) " } else { "(转JPEG) " },
+            req_width,
+            req_height,
+            req_fps
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let reader = SendCom(reader);
+        let source = SendCom(source);
+        let _ = thread::Builder::new()
+            .name(format!("mf-capture-{}", camera_index))
+            .spawn({
+                let tx = tx.clone();
+                let last_frame_time = last_frame_time.clone();
+                move || capture_loop(reader, source, chosen, tx, last_frame_time, stop_clone)
+            })
+            .map_err(|e| anyhow!("创建采集线程失败: {e}"))?;
+
+        Ok(CaptureInfo {
+            width: cap_width,
+            height: cap_height,
+            stop,
+        })
     }
-
-    Ok(CaptureInfo {
-        width: actual_w,
-        height: actual_h,
-        _camera: camera,
-    })
 }
 
-/// RGB888 -> JPEG 编码
-fn encode_rgb_to_jpeg(rgb: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>> {
+fn capture_loop(
+    reader: SendCom<IMFSourceReader>,
+    _source: SendCom<IMFMediaSource>,
+    fmt: ChosenFormat,
+    tx: broadcast::Sender<JpegFrame>,
+    last_frame_time: Arc<AtomicI64>,
+    stop: Arc<AtomicBool>,
+) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let seq = AtomicU64::new(0);
+        let reader = reader.0;
+
+        while !stop.load(Ordering::Relaxed) {
+            let mut actual_stream: u32 = 0;
+            let mut actual_flags: u32 = 0;
+            let mut sample_ptr: Option<IMFSample> = None;
+
+            if let Err(e) = reader.ReadSample(
+                MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                0,
+                Some(&mut actual_stream),
+                Some(&mut actual_flags),
+                None,
+                Some(&mut sample_ptr),
+            ) {
+                tracing::warn!("ReadSample 失败: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+
+            // MF_SOURCE_READERF_ENDOFSTREAM = 0x2
+            if actual_flags & 0x2 != 0 {
+                tracing::warn!("采集流结束(EOF)");
+                break;
+            }
+            let Some(sample) = sample_ptr else { continue };
+
+            let buffer = match sample.ConvertToContiguousBuffer() {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("ConvertToContiguousBuffer 失败: {e}");
+                    continue;
+                }
+            };
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            let mut max_len: u32 = 0;
+            let mut cur_len: u32 = 0;
+            if let Err(e) = buffer.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len)) {
+                tracing::warn!("IMFMediaBuffer::Lock 失败: {e}");
+                continue;
+            }
+            let data_slice = std::slice::from_raw_parts(ptr, cur_len as usize);
+            let jpeg_result: Result<Vec<u8>> = if fmt.is_mjpg {
+                Ok(data_slice.to_vec())
+            } else {
+                encode_rgb32_to_jpeg(data_slice, fmt.width, fmt.height, 80)
+            };
+            let _ = buffer.Unlock().ok();
+
+            match jpeg_result {
+                Ok(jpeg) => {
+                    let s = seq.fetch_add(1, Ordering::Relaxed);
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    last_frame_time.store(now, Ordering::Relaxed);
+                    let _ = tx.send(JpegFrame {
+                        bytes: Bytes::from(jpeg),
+                        seq: s,
+                    });
+                }
+                Err(e) => tracing::warn!("帧编码失败: {e}"),
+            }
+        }
+    }
+}
+
+fn choose_native_format(
+    reader: &IMFSourceReader,
+    req_width: u32,
+    req_height: u32,
+) -> Result<ChosenFormat> {
+    unsafe {
+        let mut best_mjpg: Option<(u32, u32)> = None;
+        let mut best_rgb: Option<(u32, u32)> = None;
+        // 记下选中的 IMFMediaType 以便 SetCurrentMediaType（类型是 IMFAttributes 的子接口）
+        let mut chosen_mt: Option<windows::Win32::Media::MediaFoundation::IMFMediaType> = None;
+
+        let mut index: u32 = 0;
+        loop {
+            let mt = match reader.GetNativeMediaType(
+                MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
+                index,
+            ) {
+                Ok(t) => t,
+                Err(_) => break,
+            };
+            index += 1;
+
+            let subtype = mt.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
+            let packed = mt.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+            let w = (packed >> 32) as u32;
+            let h = (packed & 0xFFFF_FFFF) as u32;
+
+            if subtype == MFVideoFormat_MJPG {
+                if better_fit(&best_mjpg, w, h, req_width, req_height) {
+                    best_mjpg = Some((w, h));
+                    chosen_mt = Some(mt);
+                }
+            } else if subtype == MFVideoFormat_RGB32 {
+                if better_fit(&best_rgb, w, h, req_width, req_height) {
+                    best_rgb = Some((w, h));
+                    chosen_mt = Some(mt);
+                }
+            }
+        }
+
+        let (w, h, is_mjpg) = if let Some((w, h)) = best_mjpg {
+            (w, h, true)
+        } else if let Some((w, h)) = best_rgb {
+            (w, h, false)
+        } else {
+            return Err(anyhow!("设备未提供 MJPG 或 RGB32 格式（可能是采集卡兼容问题）"));
+        };
+        let mt = chosen_mt.ok_or_else(|| anyhow!("内部错误：chosen_mt 为空"))?;
+
+        reader
+            .SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32, None, &mt)
+            .map_err(|e| anyhow!("SetCurrentMediaType 失败: {e}"))?;
+
+        Ok(ChosenFormat {
+            width: w,
+            height: h,
+            is_mjpg,
+        })
+    }
+}
+
+fn better_fit(best: &Option<(u32, u32)>, w: u32, h: u32, rw: u32, rh: u32) -> bool {
+    match best {
+        None => true,
+        Some((bw, bh)) => {
+            let dist = (w as i64 - rw as i64).abs() + (h as i64 - rh as i64).abs();
+            let bdist = (*bw as i64 - rw as i64).abs() + (*bh as i64 - rh as i64).abs();
+            dist < bdist
+        }
+    }
+}
+
+fn encode_rgb32_to_jpeg(bgra: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>> {
     use image::{codecs::jpeg::JpegEncoder, ColorType, ImageEncoder};
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    for px in bgra.chunks_exact(4) {
+        rgb.push(px[2]); // R
+        rgb.push(px[1]); // G
+        rgb.push(px[0]); // B
+    }
     let mut buf = Vec::with_capacity((width * height / 4) as usize);
     let encoder = JpegEncoder::new_with_quality(&mut buf, quality);
-    encoder.write_image(rgb, width, height, ColorType::Rgb8.into())?;
+    encoder.write_image(&rgb, width, height, ColorType::Rgb8.into())?;
     Ok(buf)
 }
 
-/// 列出当前系统所有可用摄像头
 pub fn list_cameras() -> Vec<CameraInfo> {
-    match query(ApiBackend::Auto) {
-        Ok(cams) => cams
-            .into_iter()
-            .map(|info| CameraInfo {
-                index: info.index().as_index().unwrap_or(0),
-                name: info.human_name(),
-                description: info.description().to_string(),
-            })
-            .collect(),
-        Err(e) => {
-            tracing::warn!("枚举摄像头失败: {e}");
-            vec![]
+    unsafe {
+        if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
+            // 可能已初始化，继续
         }
+        if MFStartup(MF_VERSION, 0).is_err() {
+            return vec![];
+        }
+        let (activates, _count) = match enum_devices() {
+            Ok(x) => x,
+            Err(_) => return vec![],
+        };
+
+        let mut out = Vec::new();
+        for (i, act) in activates.iter().enumerate() {
+            let mut pwstr = windows::core::PWSTR::null();
+            let mut cch: u32 = 0;
+            let name = if act
+                .GetAllocatedString(
+                    &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+                    &mut pwstr,
+                    &mut cch,
+                )
+                .is_ok()
+            {
+                let s = pwstr.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(pwstr.as_ptr() as *const _));
+                s
+            } else {
+                String::new()
+            };
+            out.push(CameraInfo {
+                index: i as u32,
+                name,
+                description: "Media Foundation".to_string(),
+            });
+        }
+        // 抑制未用警告（PCWSTR 在后续扩展会用上）
+        let _ = PCWSTR::null;
+        out
     }
 }
 
