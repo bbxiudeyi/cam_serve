@@ -166,7 +166,11 @@ impl CamApp {
 
 impl eframe::App for CamApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. 轮询托盘菜单事件
+        // 1. 注册 egui Context(只第一次),这样托盘菜单事件能唤醒 update。
+        //    register 内部会 set_event_handler,收到菜单点击时调 request_repaint。
+        tray::register_egui_ctx(ctx.clone());
+
+        // 2. 轮询托盘菜单事件(事件处理器已触发重绘,这里一定能跑到)
         for cmd in tray::poll_commands() {
             match cmd {
                 TrayCommand::Quit => {
@@ -184,35 +188,33 @@ impl eframe::App for CamApp {
             }
         }
 
-        // 1.5 检查后端致命错误。有错 → 弹出设置窗口显示错误。
-        // (取走错误,只显示一次)
+        // 3. 检查后端致命错误。有错 → 弹出设置窗口显示错误。
         let backend_err = self.backend_error.lock().ok().and_then(|mut g| g.take());
         if let Some(msg) = backend_err {
             self.toast = Some((format!("✗ 后端错误: {msg}"), false, std::time::Instant::now()));
             self.settings_visible = true;
         }
 
-        // 2. 用户点窗口 X 关闭 → 改成隐藏设置(不退出整个 app)
-        //    egui 通过 ViewportInput 报告 close 请求;拦截它并重新隐藏。
+        // 4. 用户点窗口 X 关闭 → 改成隐藏设置(不退出整个 app)
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested && self.settings_visible {
             self.settings_visible = false;
-            // 取消关闭(否则会退出整个 app)
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
-        // 3. 根据设置可见性切换主窗口显隐
-        //    设置可见 → 主窗口显示并渲染设置;否则 → 隐藏
+        // 5. 根据设置可见性切换主窗口显隐
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.settings_visible));
 
-        // 4. 渲染设置 UI(只在可见时才有意义,但 egui 总要画点东西)
+        // 6. 渲染设置 UI(只在可见时才有意义,但 egui 总要画点东西)
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.settings_visible {
                 self.settings_ui(ui);
             }
         });
 
-        // 5. 持续重绘,让托盘事件及时响应
-        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        // 7. 持续重绘(设置窗口打开时刷新 Toast;托盘事件已由事件处理器唤醒)
+        if self.settings_visible {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 }
