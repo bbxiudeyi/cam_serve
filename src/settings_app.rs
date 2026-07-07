@@ -134,10 +134,10 @@ impl CamApp {
 
         // toast 提示(3 秒内显示)
         let mut toast_expired = false;
-        if let Some((text, _ok, t0)) = &self.toast {
+        if let Some((text, is_success, t0)) = &self.toast {
             if t0.elapsed().as_secs() < 3 {
                 ui.horizontal(|ui| {
-                    let color = if text.starts_with('✓') {
+                    let color = if *is_success {
                         egui::Color32::from_rgb(40, 120, 40)
                     } else {
                         egui::Color32::from_rgb(180, 40, 40)

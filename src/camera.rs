@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 /// 一帧 JPEG 图像（已编码好的字节流，可直接发给浏览器）
 #[derive(Clone)]
 pub struct JpegFrame {
-    pub bytes: Arc<Vec<u8>>,
+    pub bytes: bytes::Bytes,
     pub seq: u64,
 }
 
@@ -109,7 +109,7 @@ pub fn spawn_capture(
                                 .unwrap_or(0);
                             last_frame_time.store(now, std::sync::atomic::Ordering::Relaxed);
                             let _ = tx.send(JpegFrame {
-                                bytes: Arc::new(jpeg),
+                                bytes: bytes::Bytes::from(jpeg),
                                 seq,
                             });
                         }

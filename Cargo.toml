@@ -6,22 +6,21 @@ description = "USB camera live stream to web browser"
 
 [dependencies]
 # Web 框架
-axum = { version = "0.7", features = ["multipart", "ws"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 tokio = { version = "1", features = ["full"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower-http = { version = "0.6", features = ["cors"] }
 
 # 摄像头捕获：Windows 用 Media Foundation（系统自带），不需要装额外运行时
 nokhwa = { version = "0.10", default-features = false, features = ["input-msmf", "output-threaded"] }
 
 # 图像处理（nokhwa 输出 RGB 字节，需要编码成 JPEG 推给浏览器）
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+bytes = "1"
 
 # 序列化 & 工具
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

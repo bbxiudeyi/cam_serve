@@ -415,15 +415,6 @@ fn camera_manager_loop(
     }
 }
 
-/// 重新枚举摄像头并打印当前系统可见的设备列表。
-fn log_camera_list() {
-    let cams = camera::list_cameras();
-    tracing::info!("当前系统检测到 {} 个摄像头设备:", cams.len());
-    for c in cams.iter() {
-        tracing::info!("  [{}] {} - {}", c.index, c.name, c.description);
-    }
-}
-
 /// 节流地重新枚举摄像头并打印。距上次枚举不足 min_interval 则跳过,避免日志刷屏。
 fn maybe_reenumerate(last_enum: &mut Option<std::time::Instant>, min_interval: Duration) {
     let should_enum = match last_enum {
@@ -431,7 +422,11 @@ fn maybe_reenumerate(last_enum: &mut Option<std::time::Instant>, min_interval: D
         Some(t) => t.elapsed() >= min_interval,
     };
     if should_enum {
-        log_camera_list();
+        let cams = camera::list_cameras();
+        tracing::info!("当前系统检测到 {} 个摄像头设备:", cams.len());
+        for c in cams.iter() {
+            tracing::info!("  [{}] {} - {}", c.index, c.name, c.description);
+        }
         *last_enum = Some(std::time::Instant::now());
     }
 }
@@ -490,13 +485,13 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
                                     "fps": fps.round(),
                                     "seq": f.seq,
                                 });
-                                if socket.send(Message::Text(msg.to_string())).await.is_err() {
+                                if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
                                     break;
                                 }
                                 frames_in_window = 0;
                                 last_fps_check = std::time::Instant::now();
                             }
-                            if socket.send(Message::Binary((*f.bytes).clone())).await.is_err() {
+                            if socket.send(Message::Binary(f.bytes.clone())).await.is_err() {
                                 break;
                             }
                         }
