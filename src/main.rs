@@ -147,10 +147,15 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "cam-stream",
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
             // 托盘必须在创建 eframe app 的同一线程(事件循环线程)里 build,
             // 否则 Windows 上收不到托盘消息。
             let tray = tray::build();
+            // 关键:在窗口创建时(不是 update() 里)注册菜单事件处理器,
+            // 因为 update() 在隐藏窗口时可能永远不跑,导致处理器永远注册不上。
+            // 这里 cc.egui_ctx 已经可用,handler 注册后,菜单点击就能触发重绘,
+            // 唤醒 update()。
+            tray::register_egui_ctx(cc.egui_ctx.clone());
             Ok(Box::new(settings_app::CamApp::new(
                 tray,
                 control.clone(),

@@ -33,6 +33,7 @@ parking_lot = "0.12"
 eframe = "0.31"
 tray-icon = "0.24"
 muda = "0.19"
+crossbeam-channel = "0.5.16"
 
 [profile.release]
 opt-level = 3
