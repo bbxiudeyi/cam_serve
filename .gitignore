@@ -5,9 +5,6 @@
 __pycache__/
 *.py[cod]
 
-# 打包发布的压缩包(根目录的 cam-stream.zip、handle.zip 等)
-*.zip
-
 # 运行时日志
 *.log
 logs/

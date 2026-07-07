@@ -22,6 +22,11 @@ pub struct CamApp {
     backend_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// 设置窗口是否可见。托盘「设置」→ true;窗口关闭按钮 → false。
     settings_visible: bool,
+    /// 窗口当前是否在屏幕内(用于位置显隐的状态机,只在翻转时发 OuterPosition)。
+    /// 与 settings_visible 配对:settings_visible 表达「想要」,shown_on_screen 表达「现状」。
+    shown_on_screen: bool,
+    /// 是否正在退出(点托盘「退出」→ Close)。置 true 后放行 X/Close,不再 CancelClose。
+    quitting: bool,
     /// 设置里当前选中的设备 index(本地编辑状态,点「应用」才提交)
     selected: Option<u32>,
     /// 应用后的短暂提示(3 秒)
@@ -39,6 +44,8 @@ impl CamApp {
             control,
             backend_error,
             settings_visible: false,
+            shown_on_screen: false,
+            quitting: false,
             selected: None,
             toast: None,
         }
@@ -166,15 +173,14 @@ impl CamApp {
 
 impl eframe::App for CamApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. 注册 egui Context(只第一次),这样托盘菜单事件能唤醒 update。
-        //    register 内部会 set_event_handler,收到菜单点击时调 request_repaint。
-        tray::register_egui_ctx(ctx.clone());
-
-        // 2. 轮询托盘菜单事件(事件处理器已触发重绘,这里一定能跑到)
+        // 1. 轮询托盘菜单事件。窗口常驻可见,后台线程的 request_repaint() 能可靠
+        //    唤醒 update(),所以这里一定能取到命令。register 只在 main.rs 的 app
+        //    creator 里做一次;update 里不再重复注册(否则每帧 spawn 一个阻塞线程)。
         for cmd in tray::poll_commands() {
             match cmd {
                 TrayCommand::Quit => {
                     tracing::info!("收到退出命令,结束程序");
+                    self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 TrayCommand::ViewLogs => {
@@ -188,31 +194,44 @@ impl eframe::App for CamApp {
             }
         }
 
-        // 3. 检查后端致命错误。有错 → 弹出设置窗口显示错误。
+        // 2. 检查后端致命错误。有错 → 弹出设置窗口显示错误。
         let backend_err = self.backend_error.lock().ok().and_then(|mut g| g.take());
         if let Some(msg) = backend_err {
             self.toast = Some((format!("✗ 后端错误: {msg}"), false, std::time::Instant::now()));
             self.settings_visible = true;
         }
 
-        // 4. 用户点窗口 X 关闭 → 改成隐藏设置(不退出整个 app)
+        // 3. 关闭(X / Close)的处理:
+        //    - quitting(点托盘「退出」触发的 Close):放行 → 真正退出。
+        //    - 否则(用户手点 X 等):只收起设置,CancelClose 让程序继续驻留托盘。
         let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested && self.settings_visible {
+        if close_requested && !self.quitting {
             self.settings_visible = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
-        // 5. 根据设置可见性切换主窗口显隐
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.settings_visible));
+        // 4. 位置显隐:仅在 settings_visible 与 shown_on_screen 不一致时发命令,
+        //    把窗口在「屏内」与「屏外(-2000,-2000)」间搬动。从不 toggle Visible
+        //    (egui#3655:Visible(false) 后再 Visible(true)/Close 对隐藏窗口无效,
+        //     故改用 OuterPosition 实现「隐形」,窗口始终可见 → update() 可被唤醒)。
+        if self.settings_visible != self.shown_on_screen {
+            if self.settings_visible {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(120.0, 120.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(-2000.0, -2000.0)));
+            }
+            self.shown_on_screen = self.settings_visible;
+        }
 
-        // 6. 渲染设置 UI(只在可见时才有意义,但 egui 总要画点东西)
+        // 5. 渲染设置 UI(只在屏内时才有意义,但 egui 总要画点东西)
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.settings_visible {
                 self.settings_ui(ui);
             }
         });
 
-        // 7. 持续重绘(设置窗口打开时刷新 Toast;托盘事件已由事件处理器唤醒)
+        // 6. 持续重绘(设置窗口打开时刷新 Toast;托盘事件由后台线程 request_repaint 唤醒)
         if self.settings_visible {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }

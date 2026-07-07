@@ -47,11 +47,15 @@ pub fn open() -> std::io::Result<()> {
     tracing::info!("打开实时日志窗口: {}", log_file.display());
 
     // PowerShell 命令:Get-Content -Wait -Tail 200 <file>
+    // -Encoding UTF8:tracing 写日志是 UTF-8(无 BOM)。中文 Windows 的 PowerShell
+    //   默认按系统 ANSI(GBK)读,不指定就会乱码。PS 5.1/7 都接受 UTF8 这个值。
+    // [Console]::OutputEncoding=UTF8:即使读对了,PowerShell 窗口默认用 GBK 显示,
+    //   中文照样乱,必须把输出编码也切到 UTF-8。
     // -Wait      = 持续监控(等价 tail -f)
     // -Tail 200  = 启动时先显示最后 200 行
-    // -NoExit    = 命令结束后不关窗口(理论上 -Wait 不会结束,但保险)
     let ps_cmd = format!(
-        "Get-Content -Wait -Tail 200 -Path '{}'",
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
+         Get-Content -Wait -Tail 200 -Encoding UTF8 -Path '{}'",
         log_file.display()
     );
 

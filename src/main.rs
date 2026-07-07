@@ -77,6 +77,44 @@ pub(crate) fn exe_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
+/// 给 egui 装一个系统中文字体。egui 自带的默认字体只覆盖拉丁字符,
+/// 不含 CJK,所以中文(「设置」「摄像头设备」等)会渲染成方框 □。
+/// 这里直接读 Windows 系统字体目录里的雅黑/黑体等,避免把十几 MB 的字体打进 exe。
+/// 放在 family 列表末尾作 fallback:拉丁字符仍用 egui 默认字体(观感不变),
+/// 中文/标点落到这个 CJK 字体。FontData.index 支持读取 .ttc 集合(默认 0 号 face)。
+fn install_cjk_font(ctx: &egui::Context) {
+    const CANDIDATES: &[&str] = &[
+        r"C:\Windows\Fonts\msyh.ttc",   // Microsoft YaHei 微软雅黑
+        r"C:\Windows\Fonts\msyh.ttf",
+        r"C:\Windows\Fonts\simhei.ttf", // SimHei 黑体
+        r"C:\Windows\Fonts\simsun.ttc", // SimSun 宋体
+        r"C:\Windows\Fonts\Deng.ttf",   // DengXian 等线(Win10 默认 UI 字体)
+    ];
+    for path in CANDIDATES {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "cjk".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("cjk".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("cjk".to_owned());
+            ctx.set_fonts(fonts);
+            tracing::info!("已加载 CJK 字体: {path}");
+            return;
+        }
+    }
+    tracing::warn!("未找到系统中文字体,设置界面中文将显示为方框");
+}
+
 fn main() -> eframe::Result<()> {
     // 架构:主线程跑 GUI 事件循环(eframe + tray-icon);axum + 摄像头放到后台线程的
     // tokio runtime 里。两个世界通过 SharedControl(通道 + 原子)通信。
@@ -128,15 +166,23 @@ fn main() -> eframe::Result<()> {
         .expect("无法创建后端线程");
 
     // ---------- 主线程:eframe 事件循环 ----------
-    // 窗口配置:主窗口默认隐藏(无头运行,交互走托盘),设置时变可见。
-    // - with_visible(false):启动时不显示
-    // - with_inner_size:设置 UI 的尺寸(显示时用)
-    // - with_resizable(false):设置窗口固定大小
-    // 任务栏:默认隐藏时不占位;egui 在 with_visible 时会处理任务栏显示
+    // 窗口策略:常驻可见,但「移出屏幕 + 藏任务栏」对用户隐形。
+    // 为什么不能用 with_visible(false)/Visible(false) 隐藏:eframe/egui 在 Windows 上
+    // 一旦窗口 Visible(false),winit 不再派发事件,update() 永不执行(即便后台线程
+    // 调 request_repaint 也唤不醒)——托盘菜单就彻底失灵(egui#3655/#5229/#5112)。
+    // 让窗口始终「可见」,update() 才能被 request_repaint 可靠唤醒,settings_app 里
+    // 再用 OuterPosition 把它在屏内/屏外之间移动来实现「显隐」,从不动 Visible。
+    // - with_visible(true):常驻,保证事件循环活着
+    // - with_taskbar(false):Windows 不占任务栏 + 不进 Alt+Tab (WS_EX_TOOLWINDOW)
+    // - with_position([-2000,-2000]):启动即移出屏幕,用户看不到
+    // - with_inner_size / with_resizable(false):设置 UI 的固定尺寸
     let viewport = egui::ViewportBuilder::default()
-        .with_visible(false)
+        .with_visible(true)
+        .with_taskbar(false)
+        .with_position([-2000.0, -2000.0])
         .with_inner_size([420.0, 280.0])
         .with_resizable(false)
+        .with_active(false) // 启动不抢焦点(设置打开时再用 Focus 命令抢)
         .with_title("cam-stream 设置");
 
     let native_options = eframe::NativeOptions {
@@ -156,6 +202,8 @@ fn main() -> eframe::Result<()> {
             // 这里 cc.egui_ctx 已经可用,handler 注册后,菜单点击就能触发重绘,
             // 唤醒 update()。
             tray::register_egui_ctx(cc.egui_ctx.clone());
+            // 装中文字体:egui 默认字体不含 CJK,否则设置界面中文全是方框。
+            install_cjk_font(&cc.egui_ctx);
             Ok(Box::new(settings_app::CamApp::new(
                 tray,
                 control.clone(),

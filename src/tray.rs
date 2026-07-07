@@ -15,6 +15,7 @@
 
 use eframe::egui;
 use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -76,15 +77,25 @@ pub fn build() -> Tray {
     }
 }
 
+/// 后台轮询线程是否已启动(幂等保护)。register_egui_ctx 只应在 app creator
+/// 里调一次,这里再加一道全局守卫,防止误被重复调用时每次 spawn 一个阻塞线程。
+static THREAD_STARTED: AtomicBool = AtomicBool::new(false);
+
 /// 在 eframe app_creator 闭包里调用一次。
 ///
 /// 启动独立线程阻塞 recv() MenuEvent,把命令塞进 PENDING 通道,
 /// 并 request_repaint() 唤醒 eframe 的 update()。
 /// 不用 set_event_handler(会和 receiver() 互斥,导致事件丢失)。
+/// 幂等:多次调用也只起一个轮询线程(PENDING 通道由 OnceLock 保证只建一次)。
 pub fn register_egui_ctx(ctx: egui::Context) {
     let (tx, rx) = crossbeam_channel::unbounded::<TrayCommand>();
     let _ = PENDING_TX.set(tx);
     let _ = PENDING_RX.set(rx);
+
+    // 幂等:已起过线程就直接返回。swap 返回旧值,旧值为 true 表示已经起过。
+    if THREAD_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
 
     std::thread::Builder::new()
         .name("tray-event-poller".into())
@@ -106,7 +117,7 @@ pub fn register_egui_ctx(ctx: egui::Context) {
                     if let Some(tx) = PENDING_TX.get() {
                         let _ = tx.send(cmd);
                     }
-                    // 关键:唤醒 eframe 重绘,否则窗口隐藏时 update() 不跑
+                    // 关键:唤醒 eframe 重绘。窗口常驻可见时,update() 会被可靠唤起。
                     ctx.request_repaint();
                 }
             }
